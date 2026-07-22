@@ -1,0 +1,7 @@
+{
+  "name": "mokasync-github",
+  "version": "1.0.0",
+  "main": "refresh.js",
+  "engines": { "node": ">=20" },
+  "dependencies": { "googleapis": "^140.0.0" }
+}

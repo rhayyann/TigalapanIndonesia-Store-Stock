@@ -1,0 +1,28 @@
+name: MokaSync Refresh
+
+on:
+  schedule:
+    - cron: "*/5 1-13 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: mokasync-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install
+      - run: node refresh.js
+        env:
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          MOKA_CLIENT_ID: ${{ secrets.MOKA_CLIENT_ID }}
+          MOKA_CLIENT_SECRET: ${{ secrets.MOKA_CLIENT_SECRET }}
+          MOKA_REFRESH_TOKEN: ${{ secrets.MOKA_REFRESH_TOKEN }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
