@@ -265,7 +265,13 @@ function sleep(ms) {
       status: fullSuccess ? "Sukses penuh" : "Sebagian gagal",
     });
 
-    const anyFailed = result1.failedOutlets.length > 0 || result2.failedOutlets.length > 0;
+    // Status akhir job ditentukan HANYA dari refresh #2 (yang terakhir) --
+    // kalau refresh #1 sempat gagal di beberapa outlet tapi refresh #2
+    // berhasil menutupinya (gangguan sesaat sisi Moka, dll), data di akhir
+    // siklus ini tetap LENGKAP, jadi tidak seharusnya ditandai gagal.
+    // Kegagalan refresh #1 tetap tercatat di RunLog/TriggerLog untuk arsip,
+    // cuma tidak menentukan status merah/hijau job ini.
+    const anyFailed = result2.failedOutlets.length > 0;
     process.exit(anyFailed ? 1 : 0);
   } catch (err) {
     console.error("FATAL:", err);
