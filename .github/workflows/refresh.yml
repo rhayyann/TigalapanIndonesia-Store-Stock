@@ -1,18 +1,24 @@
 name: MokaSync Refresh
-
 on:
   schedule:
-    - cron: "*/5 1-13 * * *"
+    - cron: "*/5 9-21 * * *"
   workflow_dispatch: {}
-
 concurrency:
   group: mokasync-refresh
   cancel-in-progress: false
-
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # Dinaikkan dari 8 -> 10 menit. Ini buffer secukupnya untuk
+    # concurrency-limiting + retry di refresh.js (yang bikin durasi tiap
+    # run sedikit lebih lama dari sebelumnya). SENGAJA tidak dinaikkan
+    # jauh lebih tinggi (mis. 15-20 menit) -- karena job yang terlalu lama
+    # menahan slot "concurrency: mokasync-refresh" bikin run berikutnya
+    # yang keburu antre lebih berisiko dibatalkan kalau ada run KETIGA
+    # yang menyusul sebelum sempat jalan. Pantau kolom DurasiTotalDetik
+    # di TriggerLog -- kalau sering mepet ke 10 menit, turunkan
+    # OUTLET_CONCURRENCY di refresh.js, JANGAN menaikkan timeout ini lagi.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
