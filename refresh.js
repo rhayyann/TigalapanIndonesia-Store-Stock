@@ -20,16 +20,111 @@ const ALLOWED_CATEGORIES = [
   "PANJANG + RIB", "TUNIK 24S", "WANGKI MYNO",
 ];
 
+// Urutan prioritas -- outlet dengan transaksi paling cepat/ramai ditaruh
+// duluan, supaya kalau waktu/kapasitas mepet, merekalah yang paling mungkin
+// berhasil ter-refresh duluan. GANTI URUTAN INI sesuai kondisi nyata toko
+// Anda -- ini baru asumsi awal berdasarkan pola kegagalan di RunLog
+// (Makassar & Mamu Makassar paling sering gagal, kemungkinan karena
+// item/varian-nya paling banyak = kemungkinan juga paling ramai transaksi).
+const OUTLET_PRIORITY = [
+  442608,  // TIGALAPANKAOS MAKASSAR
+  443176,  // MAMU MAKASSAR
+  443177,  // TIGALAPANKAOS PALU
+  443172,  // TIGALAPANKAOS MANADO
+  1099711, // MAMU BTP
+  1124685, // MAMU KENDARI
+  1100076, // MAMU PALOPO
+  1125290, // TIGALAPANKAOS POLMAN
+  1128052, // TIGALAPANKAOS BONE
+  1111792, // TIGALAPANKAOS SAMARINDA
+  989704,  // TIGALAPANKAOS TORAJA
+  1145319, // MAMU GOWA
+];
+
 const PER_PAGE = 900;
 const TOKEN_URL = "https://api.mokapos.com/oauth/token";
 const API_BASE = "https://api.mokapos.com/v1";
 const TIMEZONE = "Asia/Makassar";
+
+// ====== KONFIGURASI CONCURRENCY & RETRY ======
+// Titik awal yang cukup konservatif -- BUKAN angka final. Pantau kolom
+// DurasiDetik/DurasiTotalDetik di RunLog/TriggerLog setelah berjalan
+// beberapa hari, lalu sesuaikan naik/turun berdasarkan data nyata:
+//   - Masih sering gagal (429/5xx)?      -> turunkan OUTLET_CONCURRENCY
+//   - Tidak pernah gagal & durasi kecil? -> boleh naikkan sedikit
+const OUTLET_CONCURRENCY = 3;   // maksimal 3 outlet di-fetch bersamaan
+const PAGE_CONCURRENCY = 4;     // maksimal 4 halaman (dalam 1 outlet) bersamaan
+const RETRY_ATTEMPTS = 3;       // percobaan ulang kalau gagal (di luar percobaan pertama)
+const RETRY_BASE_DELAY_MS = 600; // 600ms, 1200ms, 2400ms (exponential backoff)
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const MOKA_CLIENT_ID = process.env.MOKA_CLIENT_ID;
 const MOKA_CLIENT_SECRET = process.env.MOKA_CLIENT_SECRET;
 const MOKA_REFRESH_TOKEN_ENV = process.env.MOKA_REFRESH_TOKEN;
 const GOOGLE_CREDENTIALS_JSON = process.env.GOOGLE_CREDENTIALS_JSON;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ============================================================================
+// CONCURRENCY LIMITER
+// Jalankan array of async task, TAPI maksimal `limit` yang jalan bersamaan
+// di satu waktu -- sisanya antre sampai ada slot kosong. Item diproses
+// SESUAI URUTAN ARRAY-nya (worker ambil item berikutnya secara berurutan),
+// jadi kalau array-nya sudah diurutkan sesuai prioritas, item prioritas
+// tinggi otomatis kebagian slot duluan.
+// ============================================================================
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let cursor = 0;
+
+  async function runNext() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await worker(items[i], i);
+    }
+  }
+
+  const runners = Array.from({ length: Math.min(limit, items.length) }, runNext);
+  await Promise.all(runners);
+  return results;
+}
+
+// ============================================================================
+// FETCH DENGAN RETRY + EXPONENTIAL BACKOFF
+// 429 (rate limit) & 5xx (error sesaat sisi server) layak dicoba ulang.
+// 4xx lain (401, 404, dll) biasanya masalah permanen -- percuma diulang,
+// langsung dilempar sebagai error supaya cepat diketahui akar masalahnya.
+// ============================================================================
+async function fetchWithRetry(url, options, retries = RETRY_ATTEMPTS, baseDelayMs = RETRY_BASE_DELAY_MS) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let resp;
+    try {
+      resp = await fetch(url, options);
+    } catch (networkErr) {
+      if (attempt < retries) {
+        const wait = baseDelayMs * Math.pow(2, attempt);
+        console.warn(`Network error (${networkErr.message}), coba lagi dalam ${wait}ms (percobaan ${attempt + 1}/${retries})`);
+        await sleep(wait);
+        continue;
+      }
+      throw networkErr;
+    }
+
+    if (resp.ok) return resp;
+
+    const retryable = resp.status === 429 || resp.status >= 500;
+    if (retryable && attempt < retries) {
+      const wait = baseDelayMs * Math.pow(2, attempt);
+      console.warn(`HTTP ${resp.status} dari ${url}, coba lagi dalam ${wait}ms (percobaan ${attempt + 1}/${retries})`);
+      await sleep(wait);
+      continue;
+    }
+
+    throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+  }
+}
 
 async function getSheetsClient() {
   const credentials = JSON.parse(GOOGLE_CREDENTIALS_JSON);
@@ -62,7 +157,7 @@ async function getValidAccessToken(sheets) {
 
   if (accessToken && expiresAt > Date.now() + 5 * 60 * 1000) return accessToken;
 
-  const resp = await fetch(TOKEN_URL, {
+  const resp = await fetchWithRetry(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ client_id: MOKA_CLIENT_ID, client_secret: MOKA_CLIENT_SECRET, refresh_token: refreshToken, grant_type: "refresh_token" }),
@@ -98,8 +193,7 @@ function formatTimestampWITA(date) {
 
 async function fetchPage(outletId, page, dateStr, token, perPage) {
   const url = `${API_BASE}/outlets/${outletId}/inventory/item_summaries?start=${dateStr}&end=${dateStr}&page=${page}&per_page=${perPage}`;
-  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+  const resp = await fetchWithRetry(url, { headers: { Authorization: `Bearer ${token}` } });
   return (await resp.json()).data;
 }
 
@@ -112,13 +206,20 @@ function flattenResults(results, outletName) {
   return out;
 }
 
+// Halaman ke-2 dst sekarang dibatasi PAGE_CONCURRENCY (bukan Promise.all
+// tanpa batas seperti sebelumnya) -- outlet besar (Makassar, Mamu Makassar)
+// tidak lagi menembak semua halamannya sekaligus dalam 1 gelombang.
 async function crawlOutlet(outletId, outletName, dateStr, token) {
   const firstPage = await fetchPage(outletId, 1, dateStr, token, PER_PAGE);
   const totalPages = Math.max(1, Math.ceil((firstPage.total_counts || 0) / PER_PAGE));
   let rows = flattenResults(firstPage.results, outletName);
+
   if (totalPages > 1) {
-    const rest = await Promise.all(Array.from({ length: totalPages - 1 }, (_, i) => fetchPage(outletId, i + 2, dateStr, token, PER_PAGE)));
-    rest.forEach((pd) => { rows = rows.concat(flattenResults(pd.results, outletName)); });
+    const remainingPageNumbers = Array.from({ length: totalPages - 1 }, (_, i) => i + 2);
+    const pageResults = await mapWithConcurrency(remainingPageNumbers, PAGE_CONCURRENCY, (p) =>
+      fetchPage(outletId, p, dateStr, token, PER_PAGE)
+    );
+    pageResults.forEach((pd) => { rows = rows.concat(flattenResults(pd.results, outletName)); });
   }
   return rows;
 }
@@ -194,31 +295,39 @@ async function logTrigger(sheets, entry) {
   } catch (e) { console.error("Gagal menulis TriggerLog:", e.message); }
 }
 
+// ids sekarang diurutkan sesuai OUTLET_PRIORITY (bukan Object.keys(OUTLETS)
+// apa adanya) -- outlet prioritas tinggi diproses duluan oleh
+// mapWithConcurrency, jadi kalau waktu/kapasitas mepet, merekalah yang
+// paling mungkin sempat berhasil.
+function getPrioritizedOutletIds() {
+  const allIds = Object.keys(OUTLETS);
+  const priorityIds = OUTLET_PRIORITY.map(String).filter((id) => allIds.includes(id));
+  const remainingIds = allIds.filter((id) => !priorityIds.includes(id));
+  return [...priorityIds, ...remainingIds];
+}
+
 async function refreshAllOutlets() {
   const runStart = Date.now();
   const sheets = await getSheetsClient();
   const token = await getValidAccessToken(sheets);
   const dateStr = formatDateDDMMYYYY(new Date());
-  const ids = Object.keys(OUTLETS);
+  const ids = getPrioritizedOutletIds();
   let done = 0;
   const failedOutlets = [];
-
-  const results = await Promise.allSettled(ids.map(async (outletId) => {
-    const rows = await crawlOutlet(outletId, OUTLETS[outletId], dateStr, token);
-    await writeOutletCache(sheets, outletId, rows);
-    return { outletId, rowCount: rows.length };
-  }));
-
-  const nowWita = formatTimestampWITA(new Date());
   const freshTimestamps = {};
-  results.forEach((r, i) => {
-    const outletId = ids[i];
-    if (r.status === "fulfilled") {
-      console.log(`OK ${outletId} (${OUTLETS[outletId]}): ${r.value.rowCount} baris`);
+
+  // Outlet diproses maksimal OUTLET_CONCURRENCY bersamaan, sesuai urutan
+  // prioritas. Kegagalan 1 outlet ditangkap di sini (bukan lewat
+  // Promise.allSettled global) supaya outlet lain tidak terpengaruh.
+  await mapWithConcurrency(ids, OUTLET_CONCURRENCY, async (outletId) => {
+    try {
+      const rows = await crawlOutlet(outletId, OUTLETS[outletId], dateStr, token);
+      await writeOutletCache(sheets, outletId, rows);
+      console.log(`OK ${outletId} (${OUTLETS[outletId]}): ${rows.length} baris`);
       done++;
-      freshTimestamps[outletId] = nowWita;
-    } else {
-      console.error(`GAGAL ${outletId} (${OUTLETS[outletId]}): ${r.reason}`);
+      freshTimestamps[outletId] = formatTimestampWITA(new Date());
+    } catch (err) {
+      console.error(`GAGAL ${outletId} (${OUTLETS[outletId]}): ${err.message}`);
       failedOutlets.push(OUTLETS[outletId]);
     }
   });
@@ -228,13 +337,10 @@ async function refreshAllOutlets() {
   await updateMetaBatch(sheets, ids, freshTimestamps);
 
   const durationSec = Math.round((Date.now() - runStart) / 1000);
+  const nowWita = formatTimestampWITA(new Date());
   console.log(`Selesai: ${done}/${ids.length} outlet, ${durationSec} detik.`);
   await logRun(sheets, { timestamp: nowWita, outletsDone: done, outletGagal: failedOutlets.join(", "), durationSec });
   return { done, total: ids.length, failedOutlets, durationSec };
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 (async () => {
@@ -243,11 +349,21 @@ function sleep(ms) {
     const result1 = await refreshAllOutlets();
     console.log("Refresh #1 selesai:", JSON.stringify(result1));
 
-    // Jeda 2,5 menit lalu refresh sekali lagi -- karena jadwal cron GitHub
-    // Actions minimum 5 menit, trik ini bikin refresh AKTUAL jadi ~2,5 menit
-    // sekali (refresh #1 di awal run, refresh #2 di tengah, lalu trigger
-    // berikutnya 5 menit kemudian mengulang pola yang sama).
-    await sleep(150 * 1000);
+    // Jeda ADAPTIF -- target jarak refresh #1 ke #2 tetap 150 detik (2,5
+    // menit), TAPI kalau refresh #1 sudah makan waktu lebih dari itu
+    // (karena throttling/retry), langsung lanjut ke refresh #2 tanpa nunggu
+    // tambahan. Ini supaya cadence 2,5 menit tetap jadi target utama, tapi
+    // tidak dipaksakan kaku sampai bikin total durasi kelewat timeout job.
+    const targetGapMs = 150 * 1000;
+    const elapsedAfterRun1 = Date.now() - triggerStart;
+    const remainingWait = targetGapMs - elapsedAfterRun1;
+
+    if (remainingWait > 0) {
+      console.log(`Refresh #1 selesai dalam ${Math.round(elapsedAfterRun1 / 1000)}s, tunggu sisa ${Math.round(remainingWait / 1000)}s sebelum refresh #2.`);
+      await sleep(remainingWait);
+    } else {
+      console.log(`Refresh #1 makan waktu ${Math.round(elapsedAfterRun1 / 1000)}s (lebih dari target 150s) -- langsung lanjut refresh #2 tanpa jeda tambahan.`);
+    }
 
     const result2 = await refreshAllOutlets();
     console.log("Refresh #2 selesai:", JSON.stringify(result2));
