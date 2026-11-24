@@ -1,7 +1,8 @@
 name: MokaSync Refresh
 on:
   schedule:
-    - cron: "*/5 9-21 * * *"
+    # GitHub Actions cron selalu UTC. 01-13 UTC = 09:00-21:59 WITA.
+    - cron: "*/5 1-13 * * *"
   workflow_dispatch: {}
 concurrency:
   group: mokasync-refresh
